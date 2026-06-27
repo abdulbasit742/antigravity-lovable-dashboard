@@ -6,7 +6,8 @@
     "dev": "concurrently \"npm run server\" \"npm run client\"",
     "server": "tsx watch server/index.ts",
     "client": "vite",
-    "build": "tsc && vite build",
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "start": "node dist/server/index.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
