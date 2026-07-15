@@ -1,16 +1,10 @@
-/**
- * TASK 5 — All tRPC routes with full try/catch error handling.
- */
-
-import { router, publicProcedure } from './trpc';
+import { randomUUID } from 'node:crypto';
+import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
-import {
-  fetchAntigravityAccountData,
-  validateAntigravityCredential,
-} from './antigravityApi';
+import { router, protectedProcedure } from './trpc';
 import { autoScheduler } from './autoScheduler';
+import { UpstreamConfigurationError, UpstreamUnavailableError } from './antigravityApi';
 
-// --- In-memory store (replace with DB in production) ---
 interface Account {
   id: string;
   email: string;
@@ -21,6 +15,10 @@ interface Account {
   projectCount: number;
   isValid: boolean;
   lastSync: string;
+}
+
+interface PublicAccount extends Omit<Account, 'credential'> {
+  credentialConfigured: true;
 }
 
 interface RelayStep {
@@ -41,216 +39,227 @@ interface RelaySession {
 
 const accounts: Account[] = [];
 let relaySession: RelaySession | null = null;
-let screenWallState: Record<number, { profilePath: string; isRunning: boolean; url: string }> = {};
-
-// Initialize 12 screen slots
-for (let i = 0; i < 12; i++) {
+const screenWallState: Record<number, { profilePath: string; isRunning: boolean; url: string }> = {};
+for (let i = 0; i < 12; i += 1) {
   screenWallState[i] = { profilePath: `profile_${i}`, isRunning: false, url: '' };
 }
 
-function generateId(): string {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+export function resetInMemoryState(): void {
+  accounts.splice(0, accounts.length);
+  relaySession = null;
+  for (let i = 0; i < 12; i += 1) {
+    screenWallState[i] = { profilePath: `profile_${i}`, isRunning: false, url: '' };
+  }
 }
 
-// --- Routers ---
+export function toPublicAccount(account: Account): PublicAccount {
+  const { credential: _credential, ...safe } = account;
+  return { ...safe, credentialConfigured: true };
+}
+
+function upstreamError(error: unknown, action: string): never {
+  if (error instanceof UpstreamConfigurationError) {
+    throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Antigravity API is not configured' });
+  }
+  if (error instanceof UpstreamUnavailableError) {
+    throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: `Antigravity ${action} failed` });
+  }
+  if (error instanceof TRPCError) throw error;
+  throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: `${action} failed` });
+}
+
+export function validateLaunchUrl(value: string, allowLoopbackHttp = false): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new TRPCError({ code: 'BAD_REQUEST', message: 'Launch URL is invalid' });
+  }
+  if (url.username || url.password || url.protocol === 'file:') {
+    throw new TRPCError({ code: 'BAD_REQUEST', message: 'Launch URL cannot contain credentials' });
+  }
+  const hostname = url.hostname.toLowerCase();
+  const privateHost = hostname === 'localhost'
+    || hostname === '::1'
+    || /^127\./.test(hostname)
+    || /^10\./.test(hostname)
+    || /^192\.168\./.test(hostname)
+    || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname)
+    || hostname.endsWith('.local');
+  const allowedProtocol = url.protocol === 'https:'
+    || (allowLoopbackHttp && url.protocol === 'http:' && privateHost);
+  if (!allowedProtocol || (privateHost && !(allowLoopbackHttp && url.protocol === 'http:'))) {
+    throw new TRPCError({ code: 'BAD_REQUEST', message: 'Launch URL must be a public HTTPS URL' });
+  }
+  return url.toString();
+}
+
+export function csvCell(value: unknown): string {
+  let text = String(value ?? '');
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
+}
 
 const accountRouter = router({
-  list: publicProcedure.query(() => {
-    try {
-      return accounts;
-    } catch (err: unknown) {
-      throw new Error('Failed to list accounts: ' + (err instanceof Error ? err.message : String(err)));
-    }
-  }),
+  list: protectedProcedure.query(() => accounts.map(toPublicAccount)),
 
-  add: publicProcedure
-    .input(z.object({ email: z.string().email(), credential: z.string().min(10) }))
-    .mutation(async ({ input }) => {
+  add: protectedProcedure
+    .input(z.object({
+      email: z.string().trim().email().max(254),
+      credential: z.string().min(10).max(4096),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      if (accounts.length >= 100) throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Account limit reached' });
+      if (accounts.some((account) => account.email.toLowerCase() === input.email.toLowerCase())) {
+        throw new TRPCError({ code: 'CONFLICT', message: 'Account already exists' });
+      }
       try {
-        const isValid = await validateAntigravityCredential(input.credential);
-        let data = { planType: 'unknown', creditBalance: 0, creditLimit: 0, projectCount: 0 };
-        if (isValid) {
-          try {
-            const fetched = await fetchAntigravityAccountData(input.credential);
-            data = {
-              planType: fetched.planType,
-              creditBalance: fetched.creditBalance,
-              creditLimit: fetched.creditLimit,
-              projectCount: fetched.projectCount,
-            };
-          } catch {
-            // Non-fatal: continue with defaults
-          }
-        }
+        const isValid = await ctx.antigravity.validateCredential(input.credential);
+        if (!isValid) throw new TRPCError({ code: 'BAD_REQUEST', message: 'Credential was rejected' });
+        const fetched = await ctx.antigravity.fetchAccountData(input.credential);
         const account: Account = {
-          id: generateId(),
-          email: input.email,
+          id: randomUUID(),
+          email: input.email.toLowerCase(),
           credential: input.credential,
-          isValid,
+          planType: fetched.planType,
+          creditBalance: fetched.creditBalance,
+          creditLimit: fetched.creditLimit,
+          projectCount: fetched.projectCount,
+          isValid: true,
           lastSync: new Date().toISOString(),
-          ...data,
         };
         accounts.push(account);
-        return { success: true, account };
-      } catch (err: unknown) {
-        throw new Error('Failed to add account: ' + (err instanceof Error ? err.message : String(err)));
+        return { success: true, account: toPublicAccount(account) };
+      } catch (error) {
+        upstreamError(error, 'account validation');
       }
     }),
 
-  remove: publicProcedure
-    .input(z.object({ id: z.string() }))
+  remove: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
     .mutation(({ input }) => {
-      try {
-        const idx = accounts.findIndex((a) => a.id === input.id);
-        if (idx === -1) throw new Error('Account not found');
-        accounts.splice(idx, 1);
-        return { success: true };
-      } catch (err: unknown) {
-        throw new Error('Failed to remove account: ' + (err instanceof Error ? err.message : String(err)));
-      }
+      const index = accounts.findIndex((account) => account.id === input.id);
+      if (index === -1) throw new TRPCError({ code: 'NOT_FOUND', message: 'Account not found' });
+      accounts.splice(index, 1);
+      return { success: true };
     }),
 
-  sync: publicProcedure
-    .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+  sync: protectedProcedure
+    .input(z.object({ id: z.string().uuid() }))
+    .mutation(async ({ input, ctx }) => {
+      const account = accounts.find((candidate) => candidate.id === input.id);
+      if (!account) throw new TRPCError({ code: 'NOT_FOUND', message: 'Account not found' });
       try {
-        const account = accounts.find((a) => a.id === input.id);
-        if (!account) throw new Error('Account not found');
-        const data = await fetchAntigravityAccountData(account.credential);
+        const data = await ctx.antigravity.fetchAccountData(account.credential);
         account.planType = data.planType;
         account.creditBalance = data.creditBalance;
         account.creditLimit = data.creditLimit;
         account.projectCount = data.projectCount;
+        account.isValid = true;
         account.lastSync = new Date().toISOString();
-        return { success: true, account };
-      } catch (err: unknown) {
-        throw new Error('Sync failed: ' + (err instanceof Error ? err.message : String(err)));
+        return { success: true, account: toPublicAccount(account) };
+      } catch (error) {
+        account.isValid = false;
+        upstreamError(error, 'account sync');
       }
     }),
 });
 
 const relayRouter = router({
-  getSession: publicProcedure.query(() => {
-    return relaySession;
-  }),
+  getSession: protectedProcedure.query(() => relaySession),
 
-  start: publicProcedure.mutation(async () => {
-    try {
-      if (relaySession?.isRunning) {
-        throw new Error('Relay session already running');
-      }
-      const validAccounts = accounts.filter((a) => a.isValid);
-      if (validAccounts.length === 0) throw new Error('No valid accounts to relay');
+  start: protectedProcedure.mutation(async () => {
+    if (relaySession?.isRunning) throw new TRPCError({ code: 'CONFLICT', message: 'Relay session already running' });
+    const validAccounts = accounts.filter((account) => account.isValid);
+    if (!validAccounts.length) throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'No valid accounts to relay' });
 
-      relaySession = {
-        id: generateId(),
-        startedAt: new Date().toISOString(),
-        steps: validAccounts.map((a) => ({
-          accountId: a.id,
-          email: a.email,
-          creditsBefore: a.creditBalance,
-          creditsAfter: 0,
-          status: 'pending',
-        })),
-        isRunning: true,
-      };
+    const session: RelaySession = {
+      id: randomUUID(),
+      startedAt: new Date().toISOString(),
+      steps: validAccounts.map((account) => ({
+        accountId: account.id,
+        email: account.email,
+        creditsBefore: account.creditBalance,
+        creditsAfter: 0,
+        status: 'pending',
+      })),
+      isRunning: true,
+    };
+    relaySession = session;
 
-      // Run relay asynchronously
-      (async () => {
-        if (!relaySession) return;
-        for (const step of relaySession.steps) {
-          try {
-            const account = accounts.find((a) => a.id === step.accountId);
-            if (!account) continue;
-            // Simulate relay — replace with real handoff logic
-            await new Promise((r) => setTimeout(r, 300));
-            step.creditsAfter = account.creditBalance;
-            step.status = 'done';
-          } catch (err: unknown) {
-            step.status = 'error';
-            step.error = err instanceof Error ? err.message : String(err);
-          }
+    void (async () => {
+      for (const step of session.steps) {
+        if (!session.isRunning) break;
+        try {
+          const account = accounts.find((candidate) => candidate.id === step.accountId);
+          if (!account) throw new Error('Account was removed');
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          if (!session.isRunning) break;
+          step.creditsAfter = account.creditBalance;
+          step.status = 'done';
+        } catch {
+          step.status = 'error';
+          step.error = 'Relay step failed';
         }
-        relaySession.isRunning = false;
-      })();
-
-      return { success: true, sessionId: relaySession.id };
-    } catch (err: unknown) {
-      throw new Error('Failed to start relay: ' + (err instanceof Error ? err.message : String(err)));
-    }
-  }),
-
-  stop: publicProcedure.mutation(() => {
-    try {
-      if (!relaySession || !relaySession.isRunning) {
-        throw new Error('No active relay session');
       }
-      relaySession.isRunning = false;
-      return { success: true };
-    } catch (err: unknown) {
-      throw new Error('Failed to stop relay: ' + (err instanceof Error ? err.message : String(err)));
-    }
+      session.isRunning = false;
+    })();
+
+    return { success: true, sessionId: session.id };
   }),
 
-  export: publicProcedure.query(() => {
-    try {
-      if (!relaySession) throw new Error('No relay session to export');
-      const csv = [
-        'Account,Credits Before,Credits After,Status,Error',
-        ...relaySession.steps.map(
-          (s) => `${s.email},${s.creditsBefore},${s.creditsAfter},${s.status},${s.error ?? ''}`
-        ),
-      ].join('\n');
-      return { csv, filename: `relay_${relaySession.id}.csv` };
-    } catch (err: unknown) {
-      throw new Error('Export failed: ' + (err instanceof Error ? err.message : String(err)));
-    }
+  stop: protectedProcedure.mutation(() => {
+    if (!relaySession?.isRunning) throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'No active relay session' });
+    relaySession.isRunning = false;
+    return { success: true };
+  }),
+
+  export: protectedProcedure.query(() => {
+    if (!relaySession) throw new TRPCError({ code: 'NOT_FOUND', message: 'No relay session to export' });
+    const rows = [
+      ['Account', 'Credits Before', 'Credits After', 'Status', 'Error'],
+      ...relaySession.steps.map((step) => [
+        step.email,
+        step.creditsBefore,
+        step.creditsAfter,
+        step.status,
+        step.error ?? '',
+      ]),
+    ];
+    return {
+      csv: rows.map((row) => row.map(csvCell).join(',')).join('\r\n'),
+      filename: `relay_${relaySession.id}.csv`,
+    };
   }),
 });
 
 const screenRouter = router({
-  getAll: publicProcedure.query(() => {
-    return screenWallState;
-  }),
+  getAll: protectedProcedure.query(() => screenWallState),
 
-  launch: publicProcedure
-    .input(z.object({ screenIndex: z.number().min(0).max(11), url: z.string().url().optional() }))
-    .mutation(({ input }) => {
-      try {
-        const slot = screenWallState[input.screenIndex];
-        if (!slot) throw new Error(`Screen slot ${input.screenIndex} not found`);
-        if (slot.isRunning) throw new Error(`Screen ${input.screenIndex} already running`);
-        slot.isRunning = true;
-        slot.url = input.url ?? 'https://lovable.dev';
-        return { success: true, slot };
-      } catch (err: unknown) {
-        throw new Error('Failed to launch screen: ' + (err instanceof Error ? err.message : String(err)));
-      }
+  launch: protectedProcedure
+    .input(z.object({ screenIndex: z.number().int().min(0).max(11), url: z.string().trim().min(1).max(2048).optional() }))
+    .mutation(({ input, ctx }) => {
+      const slot = screenWallState[input.screenIndex];
+      if (!slot) throw new TRPCError({ code: 'NOT_FOUND', message: 'Screen slot not found' });
+      if (slot.isRunning) throw new TRPCError({ code: 'CONFLICT', message: 'Screen already running' });
+      slot.isRunning = true;
+      slot.url = validateLaunchUrl(input.url ?? 'https://lovable.dev/', ctx.config.nodeEnv !== 'production');
+      return { success: true, slot };
     }),
 
-  stop: publicProcedure
-    .input(z.object({ screenIndex: z.number().min(0).max(11) }))
+  stop: protectedProcedure
+    .input(z.object({ screenIndex: z.number().int().min(0).max(11) }))
     .mutation(({ input }) => {
-      try {
-        const slot = screenWallState[input.screenIndex];
-        if (!slot) throw new Error(`Screen slot ${input.screenIndex} not found`);
-        slot.isRunning = false;
-        slot.url = '';
-        return { success: true };
-      } catch (err: unknown) {
-        throw new Error('Failed to stop screen: ' + (err instanceof Error ? err.message : String(err)));
-      }
+      const slot = screenWallState[input.screenIndex];
+      if (!slot) throw new TRPCError({ code: 'NOT_FOUND', message: 'Screen slot not found' });
+      slot.isRunning = false;
+      slot.url = '';
+      return { success: true };
     }),
 });
 
 const schedulerRouter = router({
-  getStatus: publicProcedure.query(() => {
-    try {
-      return autoScheduler.getStatus();
-    } catch (err: unknown) {
-      throw new Error('Failed to get scheduler status: ' + (err instanceof Error ? err.message : String(err)));
-    }
-  }),
+  getStatus: protectedProcedure.query(() => autoScheduler.getStatus()),
 });
 
 export const appRouter = router({
