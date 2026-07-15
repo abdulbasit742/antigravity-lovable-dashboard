@@ -8,19 +8,33 @@ import { Toaster } from 'react-hot-toast';
 import App from './App';
 import './index.css';
 import type { AppRouter } from '../../server/routers';
+import { notifyAuthExpired } from './session';
 
 export const trpc = createTRPCReact<AppRouter>();
 
 const queryClient = new QueryClient({
   defaultOptions: {
-    queries: { refetchOnWindowFocus: false, retry: 1 },
+    queries: {
+      refetchOnWindowFocus: false,
+      retry(failureCount, error) {
+        const status = (error as { data?: { httpStatus?: number } })?.data?.httpStatus;
+        return status !== 401 && failureCount < 1;
+      },
+    },
   },
 });
 
 const trpcClient = trpc.createClient({
   transformer: superjson,
   links: [
-    httpBatchLink({ url: '/trpc' }),
+    httpBatchLink({
+      url: '/trpc',
+      fetch: async (url, options) => {
+        const response = await globalThis.fetch(url, { ...options, credentials: 'same-origin' });
+        if (response.status === 401) notifyAuthExpired();
+        return response;
+      },
+    }),
   ],
 });
 
@@ -32,5 +46,5 @@ ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
         <App />
       </QueryClientProvider>
     </trpc.Provider>
-  </React.StrictMode>
+  </React.StrictMode>,
 );
