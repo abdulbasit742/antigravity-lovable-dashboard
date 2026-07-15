@@ -2,49 +2,52 @@
 
 ## Scope
 
-These instructions apply to the entire `abdulbasit742/antigravity-lovable-dashboard` repository. More specific AGENTS.md or AGENTS.override.md files in subdirectories may refine them.
+These instructions apply to the entire `abdulbasit742/antigravity-lovable-dashboard` repository.
 
-Project: **antigravity-lovable-dashboard**.
+Project: **Antigravity Lovable Dashboard**, a React/Vite client with an Express + tRPC operator control plane.
 
-Detected root stack: **Vite + React**.
+## Architecture
 
-## Working method
-
-1. Read README.md, the relevant manifests, and nearby tests before editing.
-2. Check the current diff and preserve unrelated user changes.
-3. Make the smallest coherent change that solves the task; follow existing names, patterns, and directory boundaries.
-4. Do not hand-edit generated, vendored, dependency, build-output, model-weight, or dataset files unless the task explicitly targets them.
-5. Update tests and documentation when behavior, configuration, public APIs, or setup steps change.
+- `client/src`: browser UI; never stores passwords, sessions, or account credentials
+- `server/index.ts`: HTTP, authentication, CORS, security headers, and production static serving
+- `server/auth.ts`: signed HttpOnly operator sessions and login throttling
+- `server/config.ts`: fail-closed environment validation
+- `server/trpc.ts`: protected procedure boundary
+- `server/routers.ts`: account, relay, screen, and scheduler control-plane behavior
+- `server/antigravityApi.ts`: bounded fixed-endpoint upstream client
+- `server/**/*.test.ts`: focused node-environment regression tests
 
 ## Commands
 
-- Use the package manager selected by the committed lockfile. Do not replace lockfiles or package managers unless the task requires it.
-- Install dependencies with the matching clean/frozen install when possible; otherwise use `npm install`.
-- dev: `npm run dev`.
-- server: `npm run server`.
-- client: `npm run client`.
-- start: `npm run start`.
-- build: `npm run build`.
-- typecheck: `npm run typecheck`.
-- test: `npm run test`.
+Use Node.js 20 or newer and the committed npm lockfile.
 
-## Verification
+```bash
+npm ci --legacy-peer-deps --ignore-scripts
+npm run typecheck
+npm test
+npm run build
+npm run security-check
+npm audit --omit=dev --audit-level=high
+```
 
-- Run the narrowest relevant test first, then the repository's available lint, type-check, test, and build commands.
-- Never report a check as passed unless it was actually run. State skipped checks and the concrete reason.
-- For UI changes, verify loading, empty, error, and success states plus keyboard access and responsive layout.
-- For API or persistence changes, verify validation, authorization, failure behavior, and backward compatibility.
+The complete local gate is `npm run check && npm run security-check`.
 
-## Security and side effects
+## Security rules
 
-- Never commit secrets, tokens, passwords, private keys, production data, or populated environment files. Use documented environment variables and sanitized examples.
-- Treat migrations, deployments, billing, live network calls, account changes, destructive Git operations, and external messages as side effects. Do not perform them without explicit task authorization.
-- Validate untrusted input at trust boundaries and avoid logging credentials, personal data, prompts containing secrets, or raw third-party payloads.
-- Preserve existing architecture and external API contracts. Add dependencies or infrastructure only when the requested change clearly requires them.
+1. Every dashboard tRPC procedure must use `protectedProcedure`; health and auth endpoints are the only intended public HTTP surface.
+2. Never return or log raw account credentials, operator passwords, session cookies, environment values, or upstream payloads.
+3. Keep sessions server-verified and HttpOnly. Do not add browser token/password/credential storage.
+4. Keep production fail-closed: real authentication values and an HTTPS upstream URL are required; mock mode is development/test only.
+5. Validate origins, body sizes, upstream timeouts/response sizes, launch URLs, CSV exports, and public response schemas at their trust boundaries.
+6. Do not turn simulated relay/screen state into external automation without named-user authorization, explicit approval, durable audit events, worker isolation, and abuse controls.
+7. Treat account removal, relay start/stop, screen launch/stop, deployment, and live upstream requests as side effects.
+8. Keep Docker/Railway on the compiled `npm start` contract and run the production container as a non-root user.
 
 ## Completion checklist
 
-- The requested behavior is implemented with a focused diff.
-- Relevant automated checks pass, or any unavailable checks are clearly identified.
-- No secrets, generated artifacts, or unrelated formatting churn were introduced.
-- The final handoff summarizes changed files, verification evidence, risks, and any follow-up work.
+- Relevant focused tests pass and the suite remains discoverable through `vitest.config.ts`.
+- TypeScript and both client/server production builds pass.
+- Security scanner passes and no populated environment file or credential-shaped value is introduced.
+- Public account and health responses remain secret-free.
+- Authentication, error, loading, empty, success, keyboard, and responsive states are preserved.
+- README and audit documentation reflect changed configuration, security boundaries, or residual risks.
