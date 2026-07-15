@@ -8,8 +8,10 @@
     "client": "vite",
     "build": "vite build && tsc -p tsconfig.server.json",
     "start": "node dist/server/index.js",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build",
+    "security-check": "node scripts/security-check.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^4.36.1",
